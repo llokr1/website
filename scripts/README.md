@@ -167,6 +167,36 @@ This a link checker for Kubernetes documentation website.
   available. This is an experimental feature and aims to reduce the amount of
   work required to update links to point to localized content. It currently
   works for Markdown files only.
+- Use `--check-redirects` to report duplicate redirect sources and redirect
+  cycles made entirely from forced rules. These checks only print warnings and
+  do not change the exit status.
+- To also check the final generated `_redirects` file for cycles and missing
+  internal targets, build the site first and provide the rendered site. This
+  lets the checker account for Hugo aliases and generated pages, as well as
+  Netlify's rule that an existing file takes precedence over a non-forced
+  redirect.
+
+For example:
+
+```shell
+# Check Markdown links and safe structural checks in _redirects.base
+./scripts/linkchecker.py -n --check-redirects \
+  -f 'content/en/docs/concepts/**/*.md'
+
+# Check the generated redirect rules against the rendered site
+make build
+./scripts/linkchecker.py -n --check-redirects \
+  --redirects-file public/_redirects --site-root public \
+  -f 'content/en/docs/concepts/**/*.md'
+```
+
+The redirect validator does not perform chain or target checks for wildcard and
+conditional rules. It also skips external targets and intentional custom `404`
+responses because they cannot be classified as broken fixed-path redirects by
+this local check. Exact duplicate wildcard sources are still reported.
+
+This does not replace `make container-internal-linkcheck`, which uses htmltest
+for broader validation of links in the rendered English website.
 ```
 
 Usage: linkchecker.py -h

@@ -46,6 +46,7 @@ import glob
 import os
 import re
 import sys
+from collections import namedtuple
 
 # These are the bad links that doesn't hurt, though good to fix
 BAD_LINK_TYPES = {
@@ -81,8 +82,20 @@ LANG = None
 RESULT = {}
 # Cached redirect entries
 REDIRECTS = {}
+# Redirect entries in file order, including entries that do not perform a
+# redirect (for example, custom 404 responses)
+REDIRECT_RULES = []
+# Duplicate redirect sources, recorded as (first rule, duplicate rule)
+REDIRECT_DUPLICATES = []
 # Cached anchors in target pages
 ANCHORS = {}
+
+RedirectRule = namedtuple(
+    "RedirectRule", ["source", "target", "status", "line", "conditions"]
+)
+RedirectResolution = namedtuple(
+    "RedirectResolution", ["final_target", "chain", "cycle", "terminal_status"]
+)
 
 
 def new_record(level, message, target):
@@ -217,36 +230,232 @@ def check_file_exists(base, path, ftype="markdown"):
     return False
 
 
-def get_redirect(path):
-    """Check if the path exists in the redirect database.
+def strip_url_suffix(path):
+    """Remove the query string and fragment from a URL path."""
+    return path.split("#", 1)[0].split("?", 1)[0]
 
-    NOTE: We do NOT check if the redirect target is there or not. We do an
-    **exact** matching for redirection entries.
-    :returns: The redirect target if any, or None if not found.
+
+def is_external_url(target):
+    """Return True when target names a network URL."""
+    return target.startswith("http://") or target.startswith("https://")
+
+
+def is_fixed_path(path):
+    """Return True for an internal path without Netlify placeholders."""
+    return (path.startswith("/") and
+            "*" not in path and
+            ":" not in path)
+
+
+def redirect_status_code(status):
+    """Return a status code without Netlify's force suffix."""
+    return status.rstrip("!")
+
+
+def is_redirect_status(status):
+    """Return True for the status codes that cause an HTTP redirect."""
+    return redirect_status_code(status) in {"301", "302", "303", "307", "308"}
+
+
+def find_redirect_rule(path):
+    """Find an exact fixed-path redirect rule.
+
+    The existing checker accepted links with or without a trailing slash. Keep
+    that behavior, while preserving the source spelling from `_redirects.base`.
     """
-    global REDIRECTS
+    target = strip_url_suffix(path)
+    rule = REDIRECTS.get(target)
+    if rule:
+        return rule
+    if target.endswith("/"):
+        return REDIRECTS.get(target[:-1])
+    return REDIRECTS.get(target + "/")
 
-    def _check_redirect(t):
-        for key, value in REDIRECTS.items():
-            if key == t:  # EXACT MATCH
-                return value
+
+def generated_path_exists(site_root, path):
+    """Check whether a URL path exists in a rendered Hugo site."""
+    if not site_root or not is_fixed_path(path):
+        return False
+
+    path = strip_url_suffix(path)
+    relative_path = path.lstrip("/")
+    normalized = os.path.normpath(os.path.join(site_root, relative_path))
+    site_root = os.path.abspath(site_root)
+    normalized = os.path.abspath(normalized)
+    if os.path.commonpath([site_root, normalized]) != site_root:
+        return False
+
+    candidates = [normalized]
+    if path.endswith("/"):
+        candidates.append(os.path.join(normalized, "index.html"))
+    else:
+        candidates.extend([normalized + ".html",
+                           os.path.join(normalized, "index.html")])
+    return any(os.path.isfile(candidate) for candidate in candidates)
+
+
+def redirect_rule_applies(rule, site_root=None):
+    """Return whether Netlify would apply an exact redirect rule.
+
+    Unless a status code ends in ``!``, a generated file takes precedence over
+    a redirect. This can only be determined when a rendered site is provided.
+    """
+    if rule.status.endswith("!"):
+        return True
+    if site_root and generated_path_exists(site_root, rule.source):
+        return False
+    return True
+
+
+def resolve_redirect(path, site_root=None):
+    """Resolve a fixed redirect chain without making network requests."""
+    target = strip_url_suffix(path)
+    chain = [target]
+    visited = set()
+
+    while True:
+        rule = find_redirect_rule(target)
+        if (rule is None or not is_redirect_status(rule.status) or
+                not redirect_rule_applies(rule, site_root)):
+            terminal_status = rule.status if rule else None
+            return RedirectResolution(target, chain, False, terminal_status)
+
+        if rule.source in visited:
+            return RedirectResolution(target, chain, True, None)
+        visited.add(rule.source)
+
+        target = strip_url_suffix(rule.target)
+        chain.append(target)
+        if is_external_url(target):
+            return RedirectResolution(target, chain, False, None)
+
+
+def get_redirect(path):
+    """Return the final target for an acyclic fixed redirect chain."""
+    resolution = resolve_redirect(path)
+    if (len(resolution.chain) == 1 or resolution.cycle or
+            (resolution.terminal_status and
+             not is_redirect_status(resolution.terminal_status))):
         return None
+    return resolution.final_target
 
-    # NOTE: anchor is ignored, can be a future todo
-    parts = path.split("#")
-    target = parts[0]
-    if not target.endswith("/"):
-        target += "/"
 
-    new_target = _check_redirect(target)
-    last_target = new_target
-    while new_target:
-        new_target = _check_redirect(new_target)
-        if new_target is None:
-            break
-        last_target = new_target
+def parse_redirects(content):
+    """Parse static redirect rules and retain Netlify's first-match order."""
+    global REDIRECTS, REDIRECT_RULES, REDIRECT_DUPLICATES
 
-    return last_target
+    REDIRECTS = {}
+    REDIRECT_RULES = []
+    REDIRECT_DUPLICATES = []
+    sources = {}
+
+    for line_number, item in enumerate(content, start=1):
+        stripped = item.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+
+        parts = stripped.split()
+        if len(parts) < 2:
+            continue
+
+        status = "301"
+        condition_start = 2
+        if len(parts) >= 3 and re.fullmatch(r"\d{3}!?", parts[2]):
+            status = parts[2]
+            condition_start = 3
+
+        conditions = tuple(parts[condition_start:])
+        rule = RedirectRule(parts[0], parts[1], status, line_number,
+                            conditions)
+        REDIRECT_RULES.append(rule)
+
+        # Conditional rules cannot be resolved deterministically without a
+        # request context, so retain them for line reporting but do not add
+        # them to the exact-match lookup table.
+        if rule.conditions:
+            continue
+        if rule.source in sources:
+            REDIRECT_DUPLICATES.append((sources[rule.source], rule))
+            continue
+        sources[rule.source] = rule
+
+        if not is_fixed_path(rule.source):
+            continue
+
+        # Netlify applies the first matching rule, so keep the first one.
+        REDIRECTS[rule.source] = rule
+
+
+def validate_redirects(site_root=None):
+    """Warn about invalid fixed redirects that can be checked locally.
+
+    Duplicate sources are safe to detect from the rules alone. Cycle and
+    dangling-target checks require the rendered site so that Hugo aliases,
+    generated pages, and Netlify's file-shadowing behavior are respected.
+    Without a rendered site, only cycles made entirely from forced rules are
+    reported.
+    """
+    records = []
+
+    for first, duplicate in REDIRECT_DUPLICATES:
+        if (first.target == duplicate.target and
+                first.status == duplicate.status):
+            detail = ("Duplicate redirect source; line %d is already handled "
+                      "by line %d" % (duplicate.line, first.line))
+        else:
+            detail = ("Conflicting redirect source at line %d; Netlify uses "
+                      "the first rule from line %d (%s -> %s)" %
+                      (duplicate.line, first.line, first.source, first.target))
+        records.append(new_record("WARNING", detail, duplicate.source))
+
+    reported_cycles = set()
+    for rule in REDIRECT_RULES:
+        if (not is_fixed_path(rule.source) or rule.conditions or
+                not is_redirect_status(rule.status)):
+            continue
+
+        resolution = resolve_redirect(rule.source, site_root)
+        if resolution.cycle:
+            if not site_root:
+                cycle_rules = [
+                    find_redirect_rule(path)
+                    for path in resolution.chain[:-1]
+                ]
+                if not all(cycle_rule and cycle_rule.status.endswith("!")
+                           for cycle_rule in cycle_rules):
+                    continue
+            cycle_key = frozenset(resolution.chain)
+            if cycle_key not in reported_cycles:
+                chain = " -> ".join(resolution.chain)
+                records.append(new_record(
+                    "WARNING", "Redirect cycle detected: " + chain,
+                    rule.source))
+                reported_cycles.add(cycle_key)
+            continue
+
+        if not site_root:
+            continue
+
+        # A custom 404 response is an intentional terminal result, not a
+        # dangling redirect target.
+        if redirect_status_code(resolution.terminal_status or "") == "404":
+            continue
+
+        final_target = resolution.final_target
+        if (is_external_url(final_target) or
+                not is_fixed_path(final_target)):
+            continue
+        if generated_path_exists(site_root, final_target):
+            continue
+
+        chain = " -> ".join(resolution.chain)
+        records.append(new_record(
+            "WARNING",
+            "Redirect target does not exist in the rendered site "
+            "(chain: %s)" % chain,
+            rule.source))
+
+    return [record for record in records if record]
 
 
 def check_target(page, anchor, target):
@@ -331,7 +540,12 @@ def check_target(page, anchor, target):
 
             return new_record("ERROR", msg, target)
 
-        # taget might be a redirect entry
+        # target might be a redirect entry
+        redirect = resolve_redirect(target)
+        if redirect.cycle:
+            msg = "Link target is part of a redirect cycle: %s" % (
+                " -> ".join(redirect.chain))
+            return new_record("WARNING", msg, target)
         real_target = get_redirect(target)
         if real_target:
             msg = ("Link using redirect records, should use %s instead" %
@@ -483,13 +697,23 @@ def parse_arguments():
     PARSER.add_argument("-w", dest="in_place_edit", action="store_true",
                         help="[EXPERIMENTAL] Turns on in-place replacement "
                              "for localized content.")
+    PARSER.add_argument("--check-redirects", action="store_true",
+                        help=("Warn about duplicate and cyclic redirect "
+                              "rules, and with --site-root, dangling "
+                              "targets."))
+    PARSER.add_argument("--redirects-file", metavar="<FILE>",
+                        help=("Redirect rules to check (default: "
+                              "static/_redirects.base)."))
+    PARSER.add_argument("--site-root", metavar="<DIR>",
+                        help=("Rendered site directory used to check redirect "
+                              "targets and file shadowing."))
 
     return PARSER.parse_args()
 
 
 def main():
     """The main entry of the program."""
-    global ARGS, ROOT, REDIRECTS, PARSER, LANG
+    global ARGS, ROOT, PARSER, LANG
 
     ARGS = parse_arguments()
     ROOT = os.path.join(os.path.dirname(__file__), '..')
@@ -505,26 +729,27 @@ def main():
 
     LANG = parts[1]
 
+    if ARGS.site_root and not ARGS.check_redirects:
+        PARSER.error("--site-root requires --check-redirects")
+    if ARGS.site_root and not os.path.isdir(ARGS.site_root):
+        PARSER.error("--site-root must name a rendered site directory")
+
     # read redirects data
-    redirects_fn = os.path.join(ROOT, "static", "_redirects.base")
+    redirects_fn = (ARGS.redirects_file or
+                    os.path.join(ROOT, "static", "_redirects.base"))
     try:
         with open(redirects_fn, "r") as f:
             data = f.readlines()
-        for item in data:
-            parts = item.split()
-            # There are entries without 301 specified
-            if len(parts) < 2:
-                continue
-            entry = parts[0]
-            # There are some entries not ended with "/"
-            if entry.endswith("/"):
-                REDIRECTS[entry] = parts[1]
-            else:
-                REDIRECTS[entry + "/"] = parts[1]
+        parse_redirects(data)
 
     except Exception as ex:
         print("[Error] failed in reading redirects file: " + str(ex))
         return
+
+    if ARGS.check_redirects:
+        redirect_records = validate_redirects(ARGS.site_root)
+        if redirect_records:
+            RESULT[redirects_fn] = redirect_records
 
     folders = [f for f in glob.glob(ARGS.filter, recursive=True)]
     for page in folders:
